@@ -687,6 +687,7 @@ typedef struct {
     long long maxlen; /* After trimming, leave stream at this length . */
     /* TRIM_STRATEGY_MINID options */
     streamID minid; /* Trim by ID (No stream entries with ID < 'minid' will remain) */
+    sds consumer_hint;
 } streamAddTrimArgs;
 
 #define TRIM_STRATEGY_NONE 0
@@ -975,7 +976,11 @@ static int streamParseAddOrTrimArgsOrReply(client *c, streamAddTrimArgs *args, i
             i++;
         } else if (xadd && !strcasecmp(opt,"nomkstream")) {
             args->no_mkstream = 1;
-        } else if (xadd) {
+        } else if (xadd && !strcasecmp(opt,"hint") && moreargs) {
+            args->consumer_hint = c->argv[i+1]->ptr;
+            i++;
+        }
+        else if (xadd) {
             /* If we are here is a syntax error or a valid ID. */
             if (streamParseStrictIDOrReply(c,c->argv[i],&args->id,0,&args->seq_given) != C_OK)
                 return -1;
@@ -1878,7 +1883,23 @@ void xaddCommand(client *c) {
         rewriteClientCommandArgument(c, idpos, idarg);
         decrRefCount(idarg);
     }
-
+    
+    if (parsed_args.consumer_hint) {
+        dictEntry *de = dictFind(c->db->blocking_keys,c->argv[1]);
+        if (de) {
+            list *clients = dictGetVal(de);
+            listNode *ln;
+            listIter li;
+            listRewind(clients,&li);
+            while((ln = listNext(&li))) {
+                client *receiver = listNodeValue(ln);
+                if (receiver->btype != BLOCKED_STREAM) continue;
+                if (receiver->bpop.xread_consumer && !sdscmp(receiver->bpop.xread_consumer->ptr, parsed_args.consumer_hint)) {
+                    listMoveNodeHead(clients, ln);
+                }
+            }
+        }
+    }
     /* We need to signal to blocked clients that there is new data on this
      * stream. */
     signalKeyAsReady(c->db, c->argv[1], OBJ_STREAM);
