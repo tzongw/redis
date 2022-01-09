@@ -106,6 +106,24 @@ list *listAddNodeHead(list *list, void *value)
     return list;
 }
 
+list *listMoveNodeHead(list *list, listNode *node) {
+    if (list->head == node)
+        return list;
+    if (node->prev)
+        node->prev->next = node->next;
+    else
+        list->head = node->next;
+    if (node->next)
+        node->next->prev = node->prev;
+    else
+        list->tail = node->prev;
+    node->prev = NULL;
+    node->next = list->head;
+    list->head->prev = node;
+    list->head = node;
+    return list;
+}
+
 /* Add a new node to the list, to tail, containing the specified 'value'
  * pointer as value.
  *
