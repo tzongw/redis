@@ -1991,22 +1991,37 @@ void streamRewriteTrimArgument(client *c, stream *s, int trim_strategy, int idx)
     decrRefCount(arg);
 }
 
-static uint64_t hashStringObject(robj *o) {
-    serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
-    char buf[128];
-    char *str;
-    size_t len;
-    uint64_t hash;
+static uint64_t distStringObjects(robj *a, robj *b) {
+    serverAssertWithInfo(NULL,a,a->type == OBJ_STRING && b->type == OBJ_STRING);
+    char *astr, *bstr;
+    size_t alen, blen;
 
-    if (sdsEncodedObject(o)) {
-        str = o->ptr;
-        len = sdslen(str);
+    if (a == b) return 0;
+    if (sdsEncodedObject(a)) {
+        astr = a->ptr;
+        alen = sdslen(astr);
     } else {
-        len = ll2string(buf,sizeof(buf),(long)o->ptr);
-        str = buf;
+        char buf[128];
+        alen = ll2string(buf,sizeof(buf),(long)a->ptr);
+        astr = buf;
     }
-    hash = dictGenHashFunction(str, len);
-    return hash;
+    if (sdsEncodedObject(b)) {
+        bstr = b->ptr;
+        blen = sdslen(bstr);
+    } else {
+        char buf[128];
+        blen = ll2string(buf,sizeof(buf),(long)b->ptr);
+        bstr = buf;
+    }
+    size_t pos = 0;
+    while (pos < alen && pos < blen && astr[pos] == bstr[pos]) {
+        pos++;
+    }
+    if (pos == alen && pos == blen)
+        return 0;
+    uint16_t hasha = crc16(astr+pos, (int)(alen-pos));
+    uint16_t hashb = crc16(bstr+pos, (int)(blen-pos));
+    return ((UINT64_MAX - pos) << 16) + (hasha ^ hashb);
 }
 
 /* XADD key [(MAXLEN [~|=] <count> | MINID [~|=] <id>) [LIMIT <entries>]] [NOMKSTREAM] <ID or *> [field value] [field value] ... */
@@ -2100,11 +2115,10 @@ void xaddCommand(client *c) {
             listIter li;
             listRewind(clients,&li);
             uint64_t min_dist = UINT64_MAX;
-            uint64_t hash_hint = hashStringObject(parsed_args.consumer_hint);
             while((ln = listNext(&li))) {
                 client *receiver = listNodeValue(ln);
                 if (receiver->btype != BLOCKED_STREAM || !receiver->bpop.xread_consumer) continue;
-                uint64_t dist = hashStringObject(receiver->bpop.xread_consumer) - hash_hint;
+                uint64_t dist = distStringObjects(parsed_args.consumer_hint, receiver->bpop.xread_consumer);
                 if (dist < min_dist) {
                     listMoveNodeHead(clients, ln);
                     if (dist == 0) break; /* got it, exit ASAP */
