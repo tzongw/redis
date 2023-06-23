@@ -54,6 +54,7 @@ list *listCreate(void);
 void listRelease(list *list);
 void listReleaseGeneric(void *list);
 void listEmpty(list *list);
+list *listMoveNodeHead(list *list, listNode *node);
 list *listAddNodeHead(list *list, void *value);
 list *listAddNodeTail(list *list, void *value);
 list *listInsertNode(list *list, listNode *old_node, void *value, int after);
