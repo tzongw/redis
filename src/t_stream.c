@@ -687,6 +687,7 @@ typedef struct {
     long long maxlen; /* After trimming, leave stream at this length . */
     /* TRIM_STRATEGY_MINID options */
     streamID minid; /* Trim by ID (No stream entries with ID < 'minid' will remain) */
+    robj *consumer_hint;
 } streamAddTrimArgs;
 
 #define TRIM_STRATEGY_NONE 0
@@ -983,6 +984,9 @@ static int streamParseAddOrTrimArgsOrReply(client *c, streamAddTrimArgs *args, i
             i++;
         } else if (xadd && !strcasecmp(opt,"nomkstream")) {
             args->no_mkstream = 1;
+        } else if (xadd && !strcasecmp(opt,"hint") && moreargs) {
+            args->consumer_hint = c->argv[i+1];
+            i++;
         } else if (xadd) {
             /* If we are here is a syntax error or a valid ID. */
             if (streamParseStrictIDOrReply(c,c->argv[i],&args->id,0,&args->seq_given) != C_OK)
@@ -1993,6 +1997,39 @@ void streamRewriteTrimArgument(client *c, stream *s, int trim_strategy, int idx)
     decrRefCount(arg);
 }
 
+static uint64_t distStringObjects(robj *a, robj *b) {
+    serverAssertWithInfo(NULL,a,a->type == OBJ_STRING && b->type == OBJ_STRING);
+    char *astr, *bstr;
+    size_t alen, blen;
+
+    if (a == b) return 0;
+    if (sdsEncodedObject(a)) {
+        astr = a->ptr;
+        alen = sdslen(astr);
+    } else {
+        char buf[128];
+        alen = ll2string(buf,sizeof(buf),(long)a->ptr);
+        astr = buf;
+    }
+    if (sdsEncodedObject(b)) {
+        bstr = b->ptr;
+        blen = sdslen(bstr);
+    } else {
+        char buf[128];
+        blen = ll2string(buf,sizeof(buf),(long)b->ptr);
+        bstr = buf;
+    }
+    size_t pos = 0;
+    while (pos < alen && pos < blen && astr[pos] == bstr[pos]) {
+        pos++;
+    }
+    if (pos == alen && pos == blen)
+        return 0;
+    uint16_t hasha = crc16(astr+pos, (int)(alen-pos));
+    uint16_t hashb = crc16(bstr+pos, (int)(blen-pos));
+    return ((UINT64_MAX - pos) << 16) + (hasha ^ hashb);
+}
+
 /* XADD key [(MAXLEN [~|=] <count> | MINID [~|=] <id>) [LIMIT <entries>]] [NOMKSTREAM] <ID or *> [field value] [field value] ... */
 void xaddCommand(client *c) {
     /* Parse options. */
@@ -2077,7 +2114,29 @@ void xaddCommand(client *c) {
     } else {
         sdsfree(replyid);
     }
-
+    
+    if (parsed_args.consumer_hint) {
+        dictEntry *de = dictFind(c->db->blocking_keys,c->argv[1]);
+        if (de) {
+            list *clients = dictGetVal(de);
+            listNode *ln;
+            listIter li;
+            listRewind(clients,&li);
+            uint64_t min_dist = UINT64_MAX;
+            while((ln = listNext(&li))) {
+                client *receiver = listNodeValue(ln);
+                if (receiver->bstate.btype != BLOCKED_STREAM || sdslen(receiver->argv[0]->ptr) != 10) continue;
+                // blocked on XREADGROUP
+                robj *consumer = receiver->argv[3];
+                uint64_t dist = distStringObjects(parsed_args.consumer_hint, consumer);
+                if (dist < min_dist) {
+                    listMoveNodeHead(clients, ln);
+                    if (dist == 0) break; /* got it, exit ASAP */
+                    else min_dist = dist;
+                }
+            }
+        }
+    }
     /* We need to signal to blocked clients that there is new data on this
      * stream. */
     signalKeyAsReady(c->db, c->argv[1], OBJ_STREAM);
