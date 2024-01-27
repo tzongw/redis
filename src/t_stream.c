@@ -2123,6 +2123,7 @@ void xaddCommand(client *c) {
             listIter li;
             listRewind(clients,&li);
             uint64_t min_dist = UINT64_MAX;
+            listNode *min_node = NULL;
             while((ln = listNext(&li))) {
                 client *receiver = listNodeValue(ln);
                 if (receiver->bstate.btype != BLOCKED_STREAM || sdslen(receiver->argv[0]->ptr) != 10) continue;
@@ -2130,11 +2131,12 @@ void xaddCommand(client *c) {
                 robj *consumer = receiver->argv[3];
                 uint64_t dist = distStringObjects(parsed_args.consumer_hint, consumer);
                 if (dist < min_dist) {
-                    listMoveNodeHead(clients, ln);
+                    min_node = ln;
                     if (dist == 0) break; /* got it, exit ASAP */
                     else min_dist = dist;
                 }
             }
+            if (min_node) listMoveNodeHead(clients, min_node);
         }
     }
     /* We need to signal to blocked clients that there is new data on this
