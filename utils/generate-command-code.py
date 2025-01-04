@@ -242,7 +242,8 @@ class Argument(object):
 
 def to_c_name(str):
     return str.replace(":", "").replace(".", "_").replace("$", "_")\
-        .replace("^", "_").replace("*", "_").replace("-", "_")
+        .replace("^", "_").replace("*", "_").replace("-", "_") \
+        .replace("\\", "_").replace("+", "_")
 
 
 class ReplySchema(object):
@@ -285,7 +286,7 @@ class ReplySchema(object):
                 t = "JSON_TYPE_INTEGER"
                 vstr = ".value.integer=%d" % v
             
-            return "%s,\"%s\",%s" % (t, k, vstr)
+            return "%s,%s,%s" % (t, json.dumps(k), vstr)
 
         for k, v in self.schema.items():
             if isinstance(v, ReplySchema):
@@ -516,6 +517,11 @@ class Subcommand(Command):
 
 
 def create_command(name, desc):
+    flags = desc.get("command_flags")
+    if flags and "EXPERIMENTAL" in flags:
+        print("Command %s is experimental, skipping..." % name)
+        return
+
     if desc.get("container"):
         cmd = Subcommand(name.upper(), desc)
         subcommands.setdefault(desc["container"].upper(), {})[name] = cmd

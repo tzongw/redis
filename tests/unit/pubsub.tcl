@@ -85,6 +85,11 @@ start_server {tags {"pubsub network"}} {
         set rd1 [redis_deferring_client]
         assert_equal {1 2 3} [subscribe $rd1 {chan1 chan2 chan3}]
         unsubscribe $rd1
+        wait_for_condition 100 10 {
+            [regexp {cmd=unsubscribe} [r client list]] eq 1
+        } else {
+            fail "unsubscribe did not arrive"
+        }
         assert_equal 0 [r publish chan1 hello]
         assert_equal 0 [r publish chan2 hello]
         assert_equal 0 [r publish chan3 hello]
@@ -158,6 +163,11 @@ start_server {tags {"pubsub network"}} {
         set rd1 [redis_deferring_client]
         assert_equal {1 2 3} [psubscribe $rd1 {chan1.* chan2.* chan3.*}]
         punsubscribe $rd1
+        wait_for_condition 100 10 {
+            [regexp {cmd=punsubscribe} [r client list]] eq 1
+        } else {
+            fail "punsubscribe did not arrive"
+        }
         assert_equal 0 [r publish chan1.hi hello]
         assert_equal 0 [r publish chan2.hi hello]
         assert_equal 0 [r publish chan3.hi hello]
@@ -353,17 +363,60 @@ start_server {tags {"pubsub network"}} {
         $rd1 close
     }
 
-    test "Keyspace notifications: hash events test" {
-        r config set notify-keyspace-events Kh
+    foreach {type max_lp_entries} {listpackex 512 hashtable 0} {
+    test "Keyspace notifications: hash events test ($type)" {
+        r config set hash-max-listpack-entries $max_lp_entries
+        r config set notify-keyspace-events Khg
         r del myhash
         set rd1 [redis_deferring_client]
         assert_equal {1} [psubscribe $rd1 *]
-        r hmset myhash yes 1 no 0
+        r hmset myhash yes 1 no 0 f1 1 f2 2 f3_hdel 3
         r hincrby myhash yes 10
+        r hexpire myhash 999999 FIELDS 1 yes
+        r hexpireat myhash [expr {[clock seconds] + 999999}] NX FIELDS 1 no
+        r hpexpire myhash 999999 FIELDS 1 yes
+        r hpersist myhash FIELDS 1 yes
+        r hpexpire myhash 0 FIELDS 1 yes
+        assert_encoding $type myhash
         assert_equal "pmessage * __keyspace@${db}__:myhash hset" [$rd1 read]
         assert_equal "pmessage * __keyspace@${db}__:myhash hincrby" [$rd1 read]
+        assert_equal "pmessage * __keyspace@${db}__:myhash hexpire" [$rd1 read]
+        assert_equal "pmessage * __keyspace@${db}__:myhash hexpire" [$rd1 read]
+        assert_equal "pmessage * __keyspace@${db}__:myhash hexpire" [$rd1 read]
+        assert_equal "pmessage * __keyspace@${db}__:myhash hpersist" [$rd1 read]
+        assert_equal "pmessage * __keyspace@${db}__:myhash hdel" [$rd1 read]
+
+        # Test that we will get `hexpired` notification when
+        # a hash field is removed by active expire.
+        r hpexpire myhash 10 FIELDS 1 no
+        after 100 ;# Wait for active expire
+        assert_equal "pmessage * __keyspace@${db}__:myhash hexpire" [$rd1 read]
+        assert_equal "pmessage * __keyspace@${db}__:myhash hexpired" [$rd1 read]
+
+        # Test that when a field with TTL is deleted by commands like hdel without
+        # updating the global DS, active expire will not send a notification.
+        r hpexpire myhash 100 FIELDS 1 f3_hdel
+        r hdel myhash f3_hdel
+        after 200 ;# Wait for active expire
+        assert_equal "pmessage * __keyspace@${db}__:myhash hexpire" [$rd1 read]
+        assert_equal "pmessage * __keyspace@${db}__:myhash hdel" [$rd1 read]
+
+        # Test that we will get `hexpired` notification when
+        # a hash field is removed by lazy expire.
+        r debug set-active-expire 0
+        r hpexpire myhash 10 FIELDS 2 f1 f2
+        after 20
+        r hmget myhash f1 f2 ;# Trigger lazy expire
+        assert_equal "pmessage * __keyspace@${db}__:myhash hexpire" [$rd1 read]
+        # We should get only one `hexpired` notification even two fields was expired.
+        assert_equal "pmessage * __keyspace@${db}__:myhash hexpired" [$rd1 read]
+        # We should get a `del` notification after all fields were expired.
+        assert_equal "pmessage * __keyspace@${db}__:myhash del" [$rd1 read]
+        r debug set-active-expire 1
+
         $rd1 close
-    }
+    } {0} {needs:debug}
+    } ;# foreach
 
     test "Keyspace notifications: stream events test" {
         r config set notify-keyspace-events Kt

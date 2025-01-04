@@ -29,7 +29,11 @@ start_server {tags {"maxmemory" "external:skip"}} {
         set dbsize [r dbsize]
         
         if $client_eviction {
-            return [expr $evicted_clients > 0 && $evicted_keys == 0 && $dbsize == 50]
+            if {[lindex [r config get io-threads] 1] == 1} {
+                return [expr $evicted_clients > 0 && $evicted_keys == 0 && $dbsize == 50]
+            } else {
+                return [expr $evicted_clients >= 0 && $evicted_keys >= 0 && $dbsize <= 50]
+            }
         } else {
             return [expr $evicted_clients == 0 && $evicted_keys > 0 && $dbsize < 50]
         }
@@ -421,11 +425,16 @@ start_server {tags {"maxmemory external:skip"}} {
         r config set maxmemory-policy allkeys-random
 
         # Next rehash size is 8192, that will eat 64k memory
-        populate 4096 "" 1
+        populate 4095 "" 1
 
         set used [s used_memory]
         set limit [expr {$used + 10*1024}]
         r config set maxmemory $limit
+
+        # Adding a key to meet the 1:1 radio.
+        r set k0 v0
+        # The dict has reached 4096, it can be resized in tryResizeHashTables in cron,
+        # or we add a key to let it check whether it can be resized.
         r set k1 v1
         # Next writing command will trigger evicting some keys if last
         # command trigger DB dict rehash

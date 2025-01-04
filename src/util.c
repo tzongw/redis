@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-current, Redis Ltd.
+ * Copyright (c) 2012, Twitter, Inc.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -29,6 +30,7 @@
 
 #include "fmacros.h"
 #include "fpconv_dtoa.h"
+#include "fast_float_strtod.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -52,10 +54,20 @@
 
 #define UNUSED(x) ((void)(x))
 
+/* Selectively define static_assert. Attempt to avoid include server.h in this file. */
+#ifndef static_assert
+#define static_assert(expr, lit) extern char __static_assert_failure[(expr) ? 1:-1]
+#endif
+
+static_assert(UINTPTR_MAX == 0xffffffffffffffff || UINTPTR_MAX == 0xffffffff, "Unsupported pointer size");
+
 /* Glob-style pattern matching. */
 static int stringmatchlen_impl(const char *pattern, int patternLen,
-        const char *string, int stringLen, int nocase, int *skipLongerMatches)
+        const char *string, int stringLen, int nocase, int *skipLongerMatches, int nesting)
 {
+    /* Protection against abusive patterns. */
+    if (nesting > 1000) return 0;
+
     while(patternLen && stringLen) {
         switch(pattern[0]) {
         case '*':
@@ -67,7 +79,7 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
                 return 1; /* match */
             while(stringLen) {
                 if (stringmatchlen_impl(pattern+1, patternLen-1,
-                            string, stringLen, nocase, skipLongerMatches))
+                            string, stringLen, nocase, skipLongerMatches, nesting+1))
                     return 1; /* match */
                 if (*skipLongerMatches)
                     return 0; /* no match */
@@ -97,23 +109,23 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
 
             pattern++;
             patternLen--;
-            not = pattern[0] == '^';
+            not = patternLen && pattern[0] == '^';
             if (not) {
                 pattern++;
                 patternLen--;
             }
             match = 0;
             while(1) {
-                if (pattern[0] == '\\' && patternLen >= 2) {
+                if (patternLen >= 2 && pattern[0] == '\\') {
                     pattern++;
                     patternLen--;
                     if (pattern[0] == string[0])
                         match = 1;
-                } else if (pattern[0] == ']') {
-                    break;
                 } else if (patternLen == 0) {
                     pattern--;
                     patternLen++;
+                    break;
+                } else if (pattern[0] == ']') {
                     break;
                 } else if (patternLen >= 3 && pattern[1] == '-') {
                     int start = pattern[0];
@@ -174,7 +186,7 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
         pattern++;
         patternLen--;
         if (stringLen == 0) {
-            while(*pattern == '*') {
+            while(patternLen && *pattern == '*') {
                 pattern++;
                 patternLen--;
             }
@@ -186,10 +198,47 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
     return 0;
 }
 
+/* 
+ * glob-style pattern matching to check if a given pattern fully includes 
+ * the prefix of a string. For the match to succeed, the pattern must end with 
+ * an unescaped '*' character.
+ * 
+ * Returns: 1 if the `pattern` fully matches the `prefixStr`. Returns 0 otherwise.
+ */
+int prefixmatch(const char *pattern, int patternLen,
+                const char *prefixStr, int prefixStrLen, int nocase) {
+    int skipLongerMatches = 0;
+    
+    /* Step 1: Verify if the pattern matches the prefix string completely. */
+    if (!stringmatchlen_impl(pattern, patternLen, prefixStr, prefixStrLen, nocase, &skipLongerMatches, 0))
+        return 0;
+
+    /* Step 2: Verify that the pattern ends with an unescaped '*', indicating
+     * it can match any suffix of the string beyond the prefix. This check
+     * remains outside stringmatchlen_impl() to keep its complexity manageable.
+     */
+    if (patternLen == 0 || pattern[patternLen - 1] != '*' )
+        return 0;
+
+    /* Count backward the number of consecutive backslashes preceding the '*'
+     * to determine if the '*' is escaped. */
+    int backslashCount = 0;
+    for (int i = patternLen - 2; i >= 0; i--) {
+        if (pattern[i] == '\\')
+            ++backslashCount;
+        else
+            break; /* Stop counting when a non-backslash character is found. */
+    }
+
+    /* Return 1 if the '*' is not escaped (i.e., even count), 0 otherwise. */
+    return (backslashCount % 2 == 0);
+}
+
+/* Glob-style pattern matching to a string. */
 int stringmatchlen(const char *pattern, int patternLen,
         const char *string, int stringLen, int nocase) {
     int skipLongerMatches = 0;
-    return stringmatchlen_impl(pattern,patternLen,string,stringLen,nocase,&skipLongerMatches);
+    return stringmatchlen_impl(pattern,patternLen,string,stringLen,nocase,&skipLongerMatches,0);
 }
 
 int stringmatch(const char *pattern, const char *string, int nocase) {
@@ -534,6 +583,43 @@ int string2l(const char *s, size_t slen, long *lval) {
     return 1;
 }
 
+/* return 1 if c>= start && c <= end, 0 otherwise*/
+static int safe_is_c_in_range(char c, char start, char end) {
+    if (c >= start && c <= end) return 1;
+    return 0;
+}
+
+static int base_16_char_type(char c) {
+    if (safe_is_c_in_range(c, '0', '9')) return 0;
+    if (safe_is_c_in_range(c, 'a', 'f')) return 1;
+    if (safe_is_c_in_range(c, 'A', 'F')) return 2;
+    return -1;
+}
+
+/** This is an async-signal safe version of string2l to convert unsigned long to string.
+ * The function translates @param src until it reaches a value that is not 0-9, a-f or A-F, or @param we read slen characters.
+ * On successes writes the result to @param result_output and returns 1.
+ * if the string represents an overflow value, return -1. */
+int string2ul_base16_async_signal_safe(const char *src, size_t slen, unsigned long *result_output) {
+    static char ascii_to_dec[] = {'0', 'a' - 10, 'A' - 10};
+
+    int char_type = 0;
+    size_t curr_char_idx = 0;
+    unsigned long result = 0;
+    int base = 16;
+    while ((-1 != (char_type = base_16_char_type(src[curr_char_idx]))) &&
+            curr_char_idx < slen) {
+        unsigned long curr_val = src[curr_char_idx] - ascii_to_dec[char_type];
+        if ((result > ULONG_MAX / base) || (result > (ULONG_MAX - curr_val)/base)) /* Overflow. */
+            return -1;
+        result = result * base + curr_val;
+        ++curr_char_idx;
+    }
+
+    *result_output = result;
+    return 1;
+}
+
 /* Convert a string into a double. Returns 1 if the string could be parsed
  * into a (non-overflowing) double, 0 otherwise. The value will be set to
  * the parsed value when appropriate.
@@ -574,7 +660,7 @@ int string2ld(const char *s, size_t slen, long double *dp) {
 int string2d(const char *s, size_t slen, double *dp) {
     errno = 0;
     char *eptr;
-    *dp = strtod(s, &eptr);
+    *dp = fast_float_strtod(s, &eptr);
     if (slen == 0 ||
         isspace(((const char*)s)[0]) ||
         (size_t)(eptr-(char*)s) != slen ||
@@ -993,10 +1079,9 @@ long getTimeZone(void) {
 #if defined(__linux__) || defined(__sun)
     return timezone;
 #else
-    struct timeval tv;
     struct timezone tz;
 
-    gettimeofday(&tv, &tz);
+    gettimeofday(NULL, &tz);
 
     return tz.tz_minuteswest * 60L;
 #endif
@@ -1062,6 +1147,7 @@ int dirRemove(char *dname) {
 
         if (S_ISDIR(stat_entry.st_mode) != 0) {
             if (dirRemove(full_path) == -1) {
+                closedir(dir);
                 return -1;
             }
             continue;
@@ -1129,7 +1215,7 @@ int fsyncFileDir(const char *filename) {
         errno = save_errno;
         return -1;
     }
-    
+
     close(dir_fd);
     return 0;
 }
@@ -1138,7 +1224,10 @@ int fsyncFileDir(const char *filename) {
 int reclaimFilePageCache(int fd, size_t offset, size_t length) {
 #ifdef HAVE_FADVISE
     int ret = posix_fadvise(fd, offset, length, POSIX_FADV_DONTNEED);
-    if (ret) return -1;
+    if (ret) {
+        errno = ret;
+        return -1;
+    }
     return 0;
 #else
     UNUSED(fd);
@@ -1146,6 +1235,195 @@ int reclaimFilePageCache(int fd, size_t offset, size_t length) {
     UNUSED(length);
     return 0;
 #endif
+}
+
+/** An async signal safe version of fgets().
+ * Has the same behaviour as standard fgets(): reads a line from fd and stores it into the dest buffer.
+ * It stops when either (buff_size-1) characters are read, the newline character is read, or the end-of-file is reached,
+ * whichever comes first.
+ *
+ * On success, the function returns the same dest parameter. If the End-of-File is encountered and no characters have
+ * been read, the contents of dest remain unchanged and a null pointer is returned.
+ * If an error occurs, a null pointer is returned. */
+char *fgets_async_signal_safe(char *dest, int buff_size, int fd) {
+    for (int i = 0; i < buff_size; i++) {
+        /* Read one byte */
+        ssize_t bytes_read_count = read(fd, dest + i, 1);
+        /* On EOF or error return NULL */
+        if (bytes_read_count < 1) {
+            return NULL;
+        }
+        /* we found the end of the line. */
+        if (dest[i] == '\n') {
+            break;
+        }
+    }
+    return dest;
+}
+
+static const char HEX[] = "0123456789abcdef";
+
+static char *u2string_async_signal_safe(int _base, uint64_t val, char *buf) {
+    uint32_t base = (uint32_t) _base;
+    *buf-- = 0;
+    do {
+        *buf-- = HEX[val % base];
+    } while ((val /= base) != 0);
+    return buf + 1;
+}
+
+static char *i2string_async_signal_safe(int base, int64_t val, char *buf) {
+    char *orig_buf = buf;
+    const int32_t is_neg = (val < 0);
+    *buf-- = 0;
+
+    if (is_neg) {
+        val = -val;
+    }
+    if (is_neg && base == 16) {
+        int ix;
+        val -= 1;
+        for (ix = 0; ix < 16; ++ix)
+            buf[-ix] = '0';
+    }
+
+    do {
+        *buf-- = HEX[val % base];
+    } while ((val /= base) != 0);
+
+    if (is_neg && base == 10) {
+        *buf-- = '-';
+    }
+
+    if (is_neg && base == 16) {
+        int ix;
+        buf = orig_buf - 1;
+        for (ix = 0; ix < 16; ++ix, --buf) {
+            /* *INDENT-OFF* */
+            switch (*buf) {
+            case '0': *buf = 'f'; break;
+            case '1': *buf = 'e'; break;
+            case '2': *buf = 'd'; break;
+            case '3': *buf = 'c'; break;
+            case '4': *buf = 'b'; break;
+            case '5': *buf = 'a'; break;
+            case '6': *buf = '9'; break;
+            case '7': *buf = '8'; break;
+            case '8': *buf = '7'; break;
+            case '9': *buf = '6'; break;
+            case 'a': *buf = '5'; break;
+            case 'b': *buf = '4'; break;
+            case 'c': *buf = '3'; break;
+            case 'd': *buf = '2'; break;
+            case 'e': *buf = '1'; break;
+            case 'f': *buf = '0'; break;
+            }
+            /* *INDENT-ON* */
+        }
+    }
+    return buf + 1;
+}
+
+static const char *check_longlong_async_signal_safe(const char *fmt, int32_t *have_longlong) {
+    *have_longlong = 0;
+    if (*fmt == 'l') {
+        fmt++;
+        if (*fmt != 'l') {
+            *have_longlong = (sizeof(long) == sizeof(int64_t));
+        } else {
+            fmt++;
+            *have_longlong = 1;
+        }
+    }
+    return fmt;
+}
+
+int vsnprintf_async_signal_safe(char *to, size_t size, const char *format, va_list ap) {
+    char *start = to;
+    char *end = start + size - 1;
+    for (; *format; ++format) {
+        int32_t have_longlong = 0;
+        if (*format != '%') {
+            if (to == end) { /* end of buffer */
+                break;
+            }
+            *to++ = *format; /* copy ordinary char */
+            continue;
+        }
+        ++format; /* skip '%' */
+
+        format = check_longlong_async_signal_safe(format, &have_longlong);
+
+        switch (*format) {
+        case 'd':
+        case 'i':
+        case 'u':
+        case 'x':
+        case 'p':
+            {
+                int64_t ival = 0;
+                uint64_t uval = 0;
+                if (*format == 'p')
+                    have_longlong = (sizeof(void *) == sizeof(uint64_t));
+                if (have_longlong) {
+                    if (*format == 'u') {
+                        uval = va_arg(ap, uint64_t);
+                    } else {
+                        ival = va_arg(ap, int64_t);
+                    }
+                } else {
+                    if (*format == 'u') {
+                        uval = va_arg(ap, uint32_t);
+                    } else {
+                        ival = va_arg(ap, int32_t);
+                    }
+                }
+
+                {
+                    char buff[22];
+                    const int base = (*format == 'x' || *format == 'p') ? 16 : 10;
+
+/* *INDENT-OFF* */
+                    char *val_as_str = (*format == 'u') ?
+                        u2string_async_signal_safe(base, uval, &buff[sizeof(buff) - 1]) :
+                        i2string_async_signal_safe(base, ival, &buff[sizeof(buff) - 1]);
+/* *INDENT-ON* */
+
+                    /* Strip off "ffffffff" if we have 'x' format without 'll' */
+                    if (*format == 'x' && !have_longlong && ival < 0) {
+                        val_as_str += 8;
+                    }
+
+                    while (*val_as_str && to < end) {
+                        *to++ = *val_as_str++;
+                    }
+                    continue;
+                }
+            }
+        case 's':
+            {
+                const char *val = va_arg(ap, char *);
+                if (!val) {
+                    val = "(null)";
+                }
+                while (*val && to < end) {
+                    *to++ = *val++;
+                }
+                continue;
+            }
+        }
+    }
+    *to = 0;
+    return (int)(to - start);
+}
+
+int snprintf_async_signal_safe(char *to, size_t n, const char *fmt, ...) {
+    int result;
+    va_list args;
+    va_start(args, fmt);
+    result = vsnprintf_async_signal_safe(to, n, fmt, args);
+    va_end(args);
+    return result;
 }
 
 #ifdef REDIS_TEST
@@ -1427,5 +1705,3 @@ int utilTest(int argc, char **argv, int flags) {
     return 0;
 }
 #endif
-
-

@@ -3,6 +3,7 @@
 uname_S:= $(shell sh -c 'uname -s 2>/dev/null || echo not')
 
 LUA_DEBUG?=no
+LUA_COVERAGE?=no
 
 CCCOLOR="\033[34m"
 LINKCOLOR="\033[34;1m"
@@ -41,6 +42,7 @@ distclean:
 	-(cd jemalloc && [ -f Makefile ] && $(MAKE) distclean) > /dev/null || true
 	-(cd hdr_histogram && $(MAKE) clean) > /dev/null || true
 	-(cd fpconv && $(MAKE) clean) > /dev/null || true
+	-(cd fast_float && $(MAKE) clean) > /dev/null || true
 	-(rm -f .make-*)
 
 .PHONY: distclean
@@ -73,6 +75,12 @@ fpconv: .make-prerequisites
 
 .PHONY: fpconv
 
+fast_float: .make-prerequisites
+	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
+	cd fast_float && $(MAKE) libfast_float
+
+.PHONY: fast_float
+
 ifeq ($(uname_S),SunOS)
 	# Make isinf() available
 	LUA_CFLAGS= -D__C99FEATURES__=1
@@ -85,6 +93,11 @@ ifeq ($(LUA_DEBUG),yes)
 else
 	LUA_CFLAGS+= -O2 
 endif
+ifeq ($(LUA_COVERAGE),yes)
+	LUA_CFLAGS += -fprofile-arcs -ftest-coverage
+	LUA_LDFLAGS += -fprofile-arcs -ftest-coverage
+endif
+
 # lua's Makefile defines AR="ar rcu", which is unusual, and makes it more
 # challenging to cross-compile lua (and redis).  These defines make it easier
 # to fit redis into cross-compilation environments, which typically set AR.

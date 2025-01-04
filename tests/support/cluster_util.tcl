@@ -70,9 +70,18 @@ proc continuous_slot_allocation {masters} {
 # tests run.
 proc cluster_setup {masters node_count slot_allocator code} {
     # Have all nodes meet
-    for {set i 1} {$i < $node_count} {incr i} {
-        R 0 CLUSTER MEET [srv -$i host] [srv -$i port]
+    if {$::tls} {
+        set tls_cluster [lindex [R 0 CONFIG GET tls-cluster] 1]
     }
+    if {$::tls && !$tls_cluster} {
+        for {set i 1} {$i < $node_count} {incr i} {
+            R 0 CLUSTER MEET [srv -$i host] [srv -$i pport]
+        }         
+    } else {
+        for {set i 1} {$i < $node_count} {incr i} {
+            R 0 CLUSTER MEET [srv -$i host] [srv -$i port]
+        }
+    }  
 
     $slot_allocator $masters
 
@@ -189,4 +198,31 @@ proc are_hostnames_propagated {match_string} {
         }
     }
     return 1
+}
+
+proc wait_node_marked_fail {ref_node_index instance_id_to_check} {
+    wait_for_condition 1000 50 {
+        [check_cluster_node_mark fail $ref_node_index $instance_id_to_check]
+    } else {
+        fail "Replica node never marked as FAIL ('fail')"
+    }
+}
+
+proc wait_node_marked_pfail {ref_node_index instance_id_to_check} {
+    wait_for_condition 1000 50 {
+        [check_cluster_node_mark fail\? $ref_node_index $instance_id_to_check]
+    } else {
+        fail "Replica node never marked as PFAIL ('fail?')"
+    }
+}
+
+proc check_cluster_node_mark {flag ref_node_index instance_id_to_check} {
+    set nodes [get_cluster_nodes $ref_node_index]
+
+    foreach n $nodes {
+        if {[dict get $n id] eq $instance_id_to_check} {
+            return [cluster_has_flag $n $flag]
+        }
+    }
+    fail "Unable to find instance id in cluster nodes. ID: $instance_id_to_check"
 }

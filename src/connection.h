@@ -1,31 +1,10 @@
 
 /*
- * Copyright (c) 2019, Redis Labs
+ * Copyright (c) 2019-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of the Redis Source Available License 2.0
+ * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
 #ifndef __REDIS_CONNECTION_H
@@ -40,7 +19,6 @@
 
 #define CONN_INFO_LEN   32
 #define CONN_ADDR_STR_LEN 128 /* Similar to INET6_ADDRSTRLEN, hoping to handle other protocols. */
-#define MAX_ACCEPTS_PER_CALL 1000
 
 struct aeEventLoop;
 typedef struct connection connection;
@@ -82,8 +60,8 @@ typedef struct ConnectionType {
     int (*listen)(connListener *listener);
 
     /* create/shutdown/close connection */
-    connection* (*conn_create)(void);
-    connection* (*conn_create_accepted)(int fd, void *priv);
+    connection* (*conn_create)(struct aeEventLoop *el);
+    connection* (*conn_create_accepted)(struct aeEventLoop *el, int fd, void *priv);
     void (*shutdown)(struct connection *conn);
     void (*close)(struct connection *conn);
 
@@ -103,9 +81,13 @@ typedef struct ConnectionType {
     ssize_t (*sync_read)(struct connection *conn, char *ptr, ssize_t size, long long timeout);
     ssize_t (*sync_readline)(struct connection *conn, char *ptr, ssize_t size, long long timeout);
 
+    /* event loop */
+    void (*unbind_event_loop)(struct connection *conn);
+    int (*rebind_event_loop)(struct connection *conn, aeEventLoop *el);
+
     /* pending data */
-    int (*has_pending_data)(void);
-    int (*process_pending_data)(void);
+    int (*has_pending_data)(struct aeEventLoop *el);
+    int (*process_pending_data)(struct aeEventLoop *el);
 
     /* TLS specified methods */
     sds (*get_peer_cert)(struct connection *conn);
@@ -120,6 +102,7 @@ struct connection {
     short int refs;
     unsigned short int iovcnt;
     void *private_data;
+    struct aeEventLoop *el;
     ConnectionCallbackFunc conn_handler;
     ConnectionCallbackFunc write_handler;
     ConnectionCallbackFunc read_handler;
@@ -341,6 +324,28 @@ static inline int connHasReadHandler(connection *conn) {
     return conn->read_handler != NULL;
 }
 
+/* Returns true if the connection is bound to an event loop */
+static inline int connHasEventLoop(connection *conn) {
+    return conn->el != NULL;
+}
+
+/* Unbind the current event loop from the connection, so that it can be
+ * rebind to a different event loop in the future. */
+static inline void connUnbindEventLoop(connection *conn) {
+    if (conn->el == NULL) return;
+    connSetReadHandler(conn, NULL);
+    connSetWriteHandler(conn, NULL);
+    if (conn->type->unbind_event_loop)
+        conn->type->unbind_event_loop(conn);
+    conn->el = NULL;
+}
+
+/* Rebind the connection to another event loop, read/write handlers must not
+ * be installed in the current event loop */
+static inline int connRebindEventLoop(connection *conn, aeEventLoop *el) {
+    return conn->type->rebind_event_loop(conn, el);
+}
+
 /* Associate a private data pointer with the connection */
 static inline void connSetPrivateData(connection *conn, void *data) {
     conn->private_data = data;
@@ -401,14 +406,14 @@ ConnectionType *connectionTypeUnix(void);
 int connectionIndexByType(const char *typename);
 
 /* Create a connection of specified type */
-static inline connection *connCreate(ConnectionType *ct) {
-    return ct->conn_create();
+static inline connection *connCreate(struct aeEventLoop *el, ConnectionType *ct) {
+    return ct->conn_create(el);
 }
 
 /* Create an accepted connection of specified type.
  * priv is connection type specified argument */
-static inline connection *connCreateAccepted(ConnectionType *ct, int fd, void *priv) {
-    return ct->conn_create_accepted(fd, priv);
+static inline connection *connCreateAccepted(struct aeEventLoop *el, ConnectionType *ct, int fd, void *priv) {
+    return ct->conn_create_accepted(el, fd, priv);
 }
 
 /* Configure a connection type. A typical case is to configure TLS.
@@ -422,10 +427,10 @@ static inline int connTypeConfigure(ConnectionType *ct, void *priv, int reconfig
 void connTypeCleanupAll(void);
 
 /* Test all the connection type has pending data or not. */
-int connTypeHasPendingData(void);
+int connTypeHasPendingData(struct aeEventLoop *el);
 
 /* walk all the connection types and process pending data for each connection type */
-int connTypeProcessPendingData(void);
+int connTypeProcessPendingData(struct aeEventLoop *el);
 
 /* Listen on an initialized listener */
 static inline int connListen(connListener *listener) {
@@ -445,5 +450,10 @@ sds getListensInfoString(sds info);
 int RedisRegisterConnectionTypeSocket(void);
 int RedisRegisterConnectionTypeUnix(void);
 int RedisRegisterConnectionTypeTLS(void);
+
+/* Return 1 if connection is using TLS protocol, 0 if otherwise. */
+static inline int connIsTLS(connection *conn) {
+    return conn && conn->type == connectionTypeTls();
+}
 
 #endif  /* __REDIS_CONNECTION_H */
