@@ -2,8 +2,9 @@
  * Copyright (c) 2017-Present, Redis Ltd.
  * All rights reserved.
  *
- * Licensed under your choice of the Redis Source Available License 2.0
- * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "server.h"
@@ -33,6 +34,7 @@
 #define STREAM_LISTPACK_MAX_SIZE (1<<30)
 
 void streamFreeCG(streamCG *cg);
+void streamFreeCGGeneric(void *cg);
 void streamFreeNACK(streamNACK *na);
 size_t streamReplyWithRangeFromConsumerPEL(client *c, stream *s, streamID *start, streamID *end, size_t count, streamConsumer *consumer);
 int streamParseStrictIDOrReply(client *c, robj *o, streamID *id, uint64_t missing_seq, int *seq_given);
@@ -60,9 +62,9 @@ stream *streamNew(void) {
 
 /* Free a stream, including the listpacks stored inside the radix tree. */
 void freeStream(stream *s) {
-    raxFreeWithCallback(s->rax,(void(*)(void*))lpFree);
+    raxFreeWithCallback(s->rax, lpFreeGeneric);
     if (s->cgroups)
-        raxFreeWithCallback(s->cgroups,(void(*)(void*))streamFreeCG);
+        raxFreeWithCallback(s->cgroups, streamFreeCGGeneric);
     zfree(s);
 }
 
@@ -241,7 +243,7 @@ robj *streamDup(robj *o) {
 /* This is a wrapper function for lpGet() to directly get an integer value
  * from the listpack (that may store numbers as a string), converting
  * the string if needed.
- * The 'valid" argument is an optional output parameter to get an indication
+ * The 'valid' argument is an optional output parameter to get an indication
  * if the record was valid, when this parameter is NULL, the function will
  * fail with an assertion. */
 static inline int64_t lpGetIntegerIfValid(unsigned char *ele, int *valid) {
@@ -255,7 +257,7 @@ static inline int64_t lpGetIntegerIfValid(unsigned char *ele, int *valid) {
     /* The following code path should never be used for how listpacks work:
      * they should always be able to store an int64_t value in integer
      * encoded form. However the implementation may change. */
-    long long ll;
+    long long ll = 0;
     int ret = string2ll((char*)e,v,&ll);
     if (valid)
         *valid = ret;
@@ -1698,7 +1700,10 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
     while(streamIteratorGetID(&si,&id,&numfields)) {
         /* Update the group last_id if needed. */
         if (group && streamCompareID(&id,&group->last_id) > 0) {
-            if (group->entries_read != SCG_INVALID_ENTRIES_READ && !streamRangeHasTombstones(s,&group->last_id,NULL)) {
+            if (group->entries_read != SCG_INVALID_ENTRIES_READ &&
+                streamCompareID(&group->last_id, &s->first_id) >= 0 &&
+                !streamRangeHasTombstones(s,&group->last_id,NULL))
+            {
                 /* A valid counter and no tombstones between the group's last-delivered-id
                  * and the stream's last-generated-id mean we can increment the read counter
                  * to keep tracking the group's progress. */
@@ -1746,7 +1751,7 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
 
             /* Try to add a new NACK. Most of the time this will work and
              * will not require extra lookups. We'll fix the problem later
-             * if we find that there is already a entry for this ID. */
+             * if we find that there is already an entry for this ID. */
             streamNACK *nack = streamCreateNACK(consumer);
             int group_inserted =
                 raxTryInsert(group->pel,buf,sizeof(buf),nack,NULL);
@@ -1854,17 +1859,18 @@ size_t streamReplyWithRangeFromConsumerPEL(client *c, stream *s, streamID *start
 
 /* Look the stream at 'key' and return the corresponding stream object.
  * The function creates a key setting it to an empty stream if needed. */
-robj *streamTypeLookupWriteOrCreate(client *c, robj *key, int no_create) {
-    robj *o = lookupKeyWrite(c->db,key);
-    if (checkType(c,o,OBJ_STREAM)) return NULL;
-    if (o == NULL) {
-        if (no_create) {
-            addReplyNull(c);
-            return NULL;
-        }
-        o = createStreamObject();
-        dbAdd(c->db,key,o);
+kvobj *streamTypeLookupWriteOrCreate(client *c, robj *key, int no_create) {
+    dictEntryLink link;
+    kvobj *kv = lookupKeyWriteWithLink(c->db,key, &link);
+    if (checkType(c, kv, OBJ_STREAM)) return NULL;
+    if (kv != NULL) return kv;
+
+    if (no_create) {
+        addReplyNull(c);
+        return NULL;
     }
+    robj *o = createStreamObject();
+    dbAddByLink(c->db, key, &o, &link);
     return o;
 }
 
@@ -1879,7 +1885,7 @@ robj *streamTypeLookupWriteOrCreate(client *c, robj *key, int no_create) {
  * that can be represented. If 'strict' is set to 1, "-" and "+" will be
  * treated as an invalid ID.
  *
- * The ID form <ms>-* specifies a millisconds-only ID, leaving the sequence part
+ * The ID form <ms>-* specifies a milliseconds-only ID, leaving the sequence part
  * to be autogenerated. When a non-NULL 'seq_given' argument is provided, this
  * form is accepted and the argument is set to 0 unless the sequence part is
  * specified.
@@ -2055,10 +2061,10 @@ void xaddCommand(client *c) {
     }
 
     /* Lookup the stream at key. */
-    robj *o;
+    kvobj *kv;
     stream *s;
-    if ((o = streamTypeLookupWriteOrCreate(c,c->argv[1],parsed_args.no_mkstream)) == NULL) return;
-    s = o->ptr;
+    if ((kv = streamTypeLookupWriteOrCreate(c,c->argv[1],parsed_args.no_mkstream)) == NULL) return;
+    s = kv->ptr;
 
     /* Return ASAP if the stream has reached the last possible ID */
     if (s->last_id.ms == UINT64_MAX && s->last_id.seq == UINT64_MAX) {
@@ -2152,7 +2158,7 @@ void xaddCommand(client *c) {
  *   will match anything from 1-1 and 1-UINT64_MAX.
  */
 void xrangeGenericCommand(client *c, int rev) {
-    robj *o;
+    kvobj *kv;
     stream *s;
     streamID startid, endid;
     long long count = -1;
@@ -2191,10 +2197,10 @@ void xrangeGenericCommand(client *c, int rev) {
     }
 
     /* Return the specified range to the user. */
-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.emptyarray)) == NULL ||
-         checkType(c,o,OBJ_STREAM)) return;
+    if ((kv = lookupKeyReadOrReply(c, c->argv[1], shared.emptyarray)) == NULL ||
+        checkType(c, kv, OBJ_STREAM)) return;
 
-    s = o->ptr;
+    s = kv->ptr;
 
     if (count == 0) {
         addReplyNullArray(c);
@@ -2216,10 +2222,10 @@ void xrevrangeCommand(client *c) {
 
 /* XLEN key*/
 void xlenCommand(client *c) {
-    robj *o;
-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL
-        || checkType(c,o,OBJ_STREAM)) return;
-    stream *s = o->ptr;
+    kvobj *kv;
+    if ((kv = lookupKeyReadOrReply(c, c->argv[1], shared.czero)) == NULL
+        || checkType(c, kv, OBJ_STREAM)) return;
+    stream *s = kv->ptr;
     addReplyLongLong(c,s->length);
 }
 
@@ -2315,7 +2321,7 @@ void xreadCommand(client *c) {
          * starting from now. */
         int id_idx = i - streams_arg - streams_count;
         robj *key = c->argv[i-streams_count];
-        robj *o = lookupKeyRead(c->db,key);
+        kvobj *o = lookupKeyRead(c->db, key);
         if (checkType(c,o,OBJ_STREAM)) goto cleanup;
         streamCG *group = NULL;
 
@@ -2360,14 +2366,13 @@ void xreadCommand(client *c) {
                                 "just return an empty result set.");
                 goto cleanup;
             }
-            if (o) {
+            if (o && ((stream *)o->ptr)->length) {
                 stream *s = o->ptr;
-                ids[id_idx] = s->last_id;
-                if (streamDecrID(&ids[id_idx]) != C_OK) {
-                    /* shouldn't happen */
-                    addReplyError(c,"the stream last element ID is 0-0");
-                    goto cleanup;
-                }
+                /* We need to get the last valid ID.
+                 * It is impossible to use s->last_id because
+                 * entry with s->last_id may have been removed. */
+                streamLastValidID(s, &ids[id_idx]);
+                streamDecrID(&ids[id_idx]);
             } else {
                 ids[id_idx].ms = 0;
                 ids[id_idx].seq = 0;
@@ -2395,7 +2400,7 @@ void xreadCommand(client *c) {
     size_t arraylen = 0;
     void *arraylen_ptr = NULL;
     for (int i = 0; i < streams_count; i++) {
-        robj *o = lookupKeyRead(c->db,c->argv[streams_arg+i]);
+        kvobj *o = lookupKeyRead(c->db, c->argv[streams_arg + i]);
         if (o == NULL) continue;
         stream *s = o->ptr;
         streamID *gt = ids+i; /* ID must be greater than this. */
@@ -2539,6 +2544,11 @@ void streamFreeNACK(streamNACK *na) {
     zfree(na);
 }
 
+/* Generic version of streamFreeNACK. */
+void streamFreeNACKGeneric(void *na) {
+    streamFreeNACK((streamNACK *)na);
+}
+
 /* Free a consumer and associated data structures. Note that this function
  * will not reassign the pending messages associated with this consumer
  * nor will delete them from the stream, so when this function is called
@@ -2549,6 +2559,11 @@ void streamFreeConsumer(streamConsumer *sc) {
                          between the consumer and the main stream PEL. */
     sdsfree(sc->name);
     zfree(sc);
+}
+
+/* Generic version of streamFreeConsumer. */
+void streamFreeConsumerGeneric(void *sc) {
+    streamFreeConsumer((streamConsumer *)sc);
 }
 
 /* Create a new consumer group in the context of the stream 's', having the
@@ -2571,9 +2586,14 @@ streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id, lo
 
 /* Free a consumer group and all its associated data. */
 void streamFreeCG(streamCG *cg) {
-    raxFreeWithCallback(cg->pel,(void(*)(void*))streamFreeNACK);
-    raxFreeWithCallback(cg->consumers,(void(*)(void*))streamFreeConsumer);
+    raxFreeWithCallback(cg->pel, streamFreeNACKGeneric);
+    raxFreeWithCallback(cg->consumers, streamFreeConsumerGeneric);
     zfree(cg);
+}
+
+/* Generic version of streamFreeCG. */
+void streamFreeCGGeneric(void *cg) {
+    streamFreeCG((streamCG *)cg);
 }
 
 /* Lookup the consumer group in the specified stream and returns its
@@ -2748,7 +2768,7 @@ NULL
         if (s == NULL) {
             serverAssert(mkstream);
             o = createStreamObject();
-            dbAdd(c->db,c->argv[2],o);
+            dbAdd(c->db, c->argv[2], &o);
             s = o->ptr;
             signalModifiedKey(c,c->db,c->argv[2]);
         }
@@ -2846,9 +2866,9 @@ void xsetidCommand(client *c) {
         }
     }
 
-    robj *o = lookupKeyWriteOrReply(c,c->argv[1],shared.nokeyerr);
-    if (o == NULL || checkType(c,o,OBJ_STREAM)) return;
-    stream *s = o->ptr;
+    kvobj *kv = lookupKeyWriteOrReply(c, c->argv[1], shared.nokeyerr);
+    if (kv == NULL || checkType(c, kv, OBJ_STREAM)) return;
+    stream *s = kv->ptr;
 
     if (streamCompareID(&id,&s->max_deleted_entry_id) < 0) {
         addReplyError(c,"The ID specified in XSETID is smaller than current max_deleted_entry_id");
@@ -2894,14 +2914,14 @@ void xsetidCommand(client *c) {
  */
 void xackCommand(client *c) {
     streamCG *group = NULL;
-    robj *o = lookupKeyRead(c->db,c->argv[1]);
-    if (o) {
-        if (checkType(c,o,OBJ_STREAM)) return; /* Type error. */
-        group = streamLookupCG(o->ptr,c->argv[2]->ptr);
+    kvobj *kv = lookupKeyRead(c->db, c->argv[1]);
+    if (kv) {
+        if (checkType(c, kv, OBJ_STREAM)) return; /* Type error. */
+        group = streamLookupCG(kv->ptr, c->argv[2]->ptr);
     }
 
     /* No key or group? Nothing to ack. */
-    if (o == NULL || group == NULL) {
+    if (kv == NULL || group == NULL) {
         addReply(c,shared.czero);
         return;
     }
@@ -3011,12 +3031,12 @@ void xpendingCommand(client *c) {
     }
 
     /* Lookup the key and the group inside the stream. */
-    robj *o = lookupKeyRead(c->db,c->argv[1]);
+    kvobj *kv = lookupKeyRead(c->db, c->argv[1]);
     streamCG *group;
 
-    if (checkType(c,o,OBJ_STREAM)) return;
-    if (o == NULL ||
-        (group = streamLookupCG(o->ptr,groupname->ptr)) == NULL)
+    if (checkType(c, kv, OBJ_STREAM)) return;
+    if (kv == NULL ||
+        (group = streamLookupCG(kv->ptr, groupname->ptr)) == NULL)
     {
         addReplyErrorFormat(c, "-NOGROUP No such key '%s' or consumer "
                                "group '%s'",
@@ -3194,7 +3214,7 @@ void xpendingCommand(client *c) {
  * what messages it is now in charge of. */
 void xclaimCommand(client *c) {
     streamCG *group = NULL;
-    robj *o = lookupKeyRead(c->db,c->argv[1]);
+    kvobj *o = lookupKeyRead(c->db,c->argv[1]);
     long long minidle; /* Minimum idle time argument. */
     long long retrycount = -1;   /* -1 means RETRYCOUNT option not given. */
     mstime_t deliverytime = -1;  /* -1 means IDLE/TIME options not given. */
@@ -3415,7 +3435,7 @@ cleanup:
  * what messages it is now in charge of. */
 void xautoclaimCommand(client *c) {
     streamCG *group = NULL;
-    robj *o = lookupKeyRead(c->db,c->argv[1]);
+    kvobj *o = lookupKeyRead(c->db,c->argv[1]);
     long long minidle; /* Minimum idle time argument, in milliseconds. */
     long count = 100; /* Maximum entries to claim. */
     const unsigned attempts_factor = 10;
@@ -3593,11 +3613,9 @@ void xautoclaimCommand(client *c) {
  * of items actually deleted, that may be different from the number
  * of IDs passed in case certain IDs do not exist. */
 void xdelCommand(client *c) {
-    robj *o;
-
-    if ((o = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL
-        || checkType(c,o,OBJ_STREAM)) return;
-    stream *s = o->ptr;
+    kvobj *kv = lookupKeyWriteOrReply(c, c->argv[1], shared.czero); 
+    if (kv == NULL || checkType(c, kv, OBJ_STREAM)) return;
+    stream *s = kv->ptr;
 
     /* We need to sanity check the IDs passed to start. Even if not
      * a big issue, it is not great that the command is only partially
@@ -3675,8 +3693,6 @@ cleanup:
  *                             Has meaning only if `~` was provided.
  */
 void xtrimCommand(client *c) {
-    robj *o;
-
     /* Argument parsing. */
     streamAddTrimArgs parsed_args;
     if (streamParseAddOrTrimArgsOrReply(c, &parsed_args, 0) < 0)
@@ -3684,9 +3700,9 @@ void xtrimCommand(client *c) {
 
     /* If the key does not exist, we are ok returning zero, that is, the
      * number of elements removed from the stream. */
-    if ((o = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL
-        || checkType(c,o,OBJ_STREAM)) return;
-    stream *s = o->ptr;
+    kvobj *kv = lookupKeyWriteOrReply(c, c->argv[1], shared.czero); 
+    if (kv == NULL || checkType(c, kv, OBJ_STREAM)) return;
+    stream *s = kv->ptr;
 
     /* Perform the trimming. */
     int64_t deleted = streamTrim(s, &parsed_args);
@@ -3946,9 +3962,9 @@ NULL
     key = c->argv[2];
 
     /* Lookup the key now, this is common for all the subcommands but HELP. */
-    robj *o = lookupKeyReadOrReply(c,key,shared.nokeyerr);
-    if (o == NULL || checkType(c,o,OBJ_STREAM)) return;
-    s = o->ptr;
+    kvobj *kv = lookupKeyReadOrReply(c, key, shared.nokeyerr);
+    if (kv == NULL || checkType(c, kv, OBJ_STREAM)) return;
+    s = kv->ptr;
 
     /* Dispatch the different subcommands. */
     if (!strcasecmp(opt,"CONSUMERS") && c->argc == 4) {
