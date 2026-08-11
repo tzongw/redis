@@ -73,6 +73,19 @@ void disableTracking(client *c) {
 
     /* Clear flags and adjust the count. */
     if (c->flags & CLIENT_TRACKING) {
+        /* If the client redirects invalidation messages to another client and
+         * the redirection is not broken, notify the redirection target (if it
+         * is a Pub/Sub client) that the tracking source was disabled. */
+        if (c->client_tracking_redirection &&
+            !(c->flags & CLIENT_TRACKING_BROKEN_REDIR))
+        {
+            client *redir = lookupClientByID(c->client_tracking_redirection);
+            if (redir && redir->flags & CLIENT_PUBSUB) {
+                robj *msg = createStringObject("tracking-source-disabled",24);
+                addReplyPubsubMessage(redir,TrackingChannelName,msg,shared.messagebulk);
+                decrRefCount(msg);
+            }
+        }
         server.tracking_clients--;
         c->flags &= ~(CLIENT_TRACKING|CLIENT_TRACKING_BROKEN_REDIR|
                       CLIENT_TRACKING_BCAST|CLIENT_TRACKING_OPTIN|
