@@ -1943,7 +1943,7 @@ void unlinkClient(client *c) {
     c->cmd = NULL;
 
     /* Clear the tracking status. */
-    if (c->flags & CLIENT_TRACKING) disableTracking(c);
+    if (c->flags & CLIENT_TRACKING) disableTracking(c,0);
 }
 
 /* Remove client from the list of clients with pending referenced replies.
@@ -2042,7 +2042,7 @@ void clearClientConnectionState(client *c) {
 
     serverAssert(!(c->flags &(CLIENT_SLAVE|CLIENT_MASTER)));
 
-    if (c->flags & CLIENT_TRACKING) disableTracking(c);
+    if (c->flags & CLIENT_TRACKING) disableTracking(c,0);
     selectDb(c,0);
 #ifdef LOG_REQ_RES
     c->resp = server.client_default_resp;
@@ -4732,7 +4732,7 @@ NULL
 
             enableTracking(c,redir,options,prefix,numprefix);
         } else if (!strcasecmp(c->argv[2]->ptr,"off")) {
-            disableTracking(c);
+            disableTracking(c,1);
         } else {
             zfree(prefix);
             addReplyErrorObject(c,shared.syntaxerr);

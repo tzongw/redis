@@ -43,8 +43,14 @@ typedef struct bcastState {
  * tracking mode, because we just store the ID of the client in the tracking
  * table, so we'll remove the ID reference in a lazy way. Otherwise when a
  * client with many entries in the table is removed, it would cost a lot of
- * time to do the cleanup. */
-void disableTracking(client *c) {
+ * time to do the cleanup.
+ *
+ * The 'voluntary' parameter indicates whether tracking was disabled by an
+ * explicit CLIENT TRACKING OFF command from the client (1), or because the
+ * data connection was terminated (0). When the tracking source disconnects
+ * involuntarily and has a valid redirection target, we send a NULL message
+ * to the redirect client to signal that all keys should be invalidated. */
+void disableTracking(client *c, int voluntary) {
     /* If this client is in broadcasting mode, we need to unsubscribe it
      * from all the prefixes it is registered to. */
     if (c->flags & CLIENT_TRACKING_BCAST) {
@@ -74,16 +80,19 @@ void disableTracking(client *c) {
     /* Clear flags and adjust the count. */
     if (c->flags & CLIENT_TRACKING) {
         /* If the client redirects invalidation messages to another client and
-         * the redirection is not broken, notify the redirection target (if it
-         * is a Pub/Sub client) that the tracking source was disabled. */
-        if (c->client_tracking_redirection &&
+         * the redirection is not broken, and the tracking was not disabled
+         * voluntarily by the client itself, notify the redirection target
+         * (if it is a Pub/Sub client) that the tracking source was disabled. */
+        if (!voluntary &&
+            c->client_tracking_redirection &&
             !(c->flags & CLIENT_TRACKING_BROKEN_REDIR))
         {
             client *redir = lookupClientByID(c->client_tracking_redirection);
             if (redir && redir->flags & CLIENT_PUBSUB) {
-                robj *msg = createStringObject("tracking-source-disabled",24);
-                addReplyPubsubMessage(redir,TrackingChannelName,msg,shared.messagebulk);
-                decrRefCount(msg);
+                /* Send a NULL message to indicate that all keys
+                 * should be invalidated. */
+                addReplyPubsubMessage(redir,TrackingChannelName,NULL,shared.messagebulk);
+                addReply(redir,shared.null[redir->resp]);
             }
         }
         server.tracking_clients--;
